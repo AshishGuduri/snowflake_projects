@@ -1,0 +1,156 @@
+CREATE OR REPLACE WAREHOUSE P19a_WH;
+CREATE OR REPLACE DATABASE P19a_DB;
+CREATE OR REPLACE SCHEMA P19a_SCHEMA;
+
+USE WAREHOUSE P19a_WH;
+USE DATABASE  P19a_DB;
+USE SCHEMA P19a_SCHEMA;
+
+CREATE OR REPLACE FILE FORMAT CSV_FF
+    TYPE = 'CSV'
+    FIELD_DELIMITER = ','
+    SKIP_HEADER = 1
+    NULL_IF = ('NULL', '')
+    EMPTY_FIELD_AS_NULL = TRUE;
+
+CREATE OR REPLACE STAGE PROJECT_19A_STAGE
+    FILE_FORMAT = CSV_FF;
+
+CREATE OR REPLACE TABLE RAW_ORDERS (
+    order_id         VARCHAR(20),
+    order_date       DATE,
+    user_id          VARCHAR(20),
+    store_id         VARCHAR(20),
+    amount           NUMBER(10,2),
+    tax              NUMBER(10,2),
+    payment_method   VARCHAR(20),
+    shipping_option  VARCHAR(20),
+    gift_wrap_flag   VARCHAR(1)
+);
+
+COPY INTO RAW_ORDERS
+FROM @PROJECT_19A_STAGE/raw_orders.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FF)
+ON_ERROR = 'ABORT_STATEMENT';
+
+CREATE OR REPLACE TABLE RAW_INVENTORY (
+    snapshot_date  DATE,
+    store_id       VARCHAR(20),
+    product_id     VARCHAR(20),
+    qty_on_hand    NUMBER(10,0),
+    unit_cost      NUMBER(10,2)
+);
+
+COPY INTO RAW_INVENTORY
+FROM @PROJECT_19A_STAGE/raw_inventory.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FF)
+ON_ERROR = 'ABORT_STATEMENT';
+
+CREATE OR REPLACE TABLE RAW_FULFILLMENT (
+    order_id       VARCHAR(20),
+    order_date     DATE,
+    pick_date      DATE,
+    ship_date      DATE,
+    delivery_date  DATE
+);
+
+COPY INTO RAW_FULFILLMENT
+FROM @PROJECT_19A_STAGE/raw_fulfillment.csv
+FILE_FORMAT = (FORMAT_NAME = CSV_FF)
+ON_ERROR = 'ABORT_STATEMENT';
+
+-- Task 1: Junk dimension DIM_ORDER_INDICATORS
+CREATE OR REPLACE TABLE DIM_ORDER_INDICATORS AS
+WITH first_appearance AS (
+    SELECT
+        payment_method,
+        shipping_option,
+        gift_wrap_flag,
+        MIN(order_id) AS first_order_id
+    FROM RAW_ORDERS
+    GROUP BY payment_method, shipping_option, gift_wrap_flag
+)
+SELECT
+    ROW_NUMBER() OVER (ORDER BY first_order_id) AS INDICATOR_SK,
+    payment_method   AS PAYMENT_METHOD,
+    shipping_option  AS SHIPPING_OPTION,
+    gift_wrap_flag   AS GIFT_WRAP_FLAG
+FROM first_appearance;
+
+SELECT * FROM DIM_ORDER_INDICATORS ORDER BY INDICATOR_SK;
+
+-- Task 2: Transaction fact FACT_SALES_TRANSACTIONS
+CREATE OR REPLACE TABLE FACT_SALES_TRANSACTIONS AS
+SELECT
+    o.order_id     AS ORDER_ID,
+    o.order_date   AS ORDER_DATE,
+    o.user_id      AS USER_ID,
+    o.store_id     AS STORE_ID,
+    d.INDICATOR_SK,
+    o.amount       AS AMOUNT,
+    o.tax          AS TAX
+FROM RAW_ORDERS o
+JOIN DIM_ORDER_INDICATORS d
+  ON o.payment_method  = d.PAYMENT_METHOD
+ AND o.shipping_option = d.SHIPPING_OPTION
+ AND o.gift_wrap_flag  = d.GIFT_WRAP_FLAG;
+
+SELECT ORDER_ID, INDICATOR_SK, AMOUNT
+FROM FACT_SALES_TRANSACTIONS
+ORDER BY ORDER_ID;
+
+-- Task 3: Periodic snapshot FACT_INVENTORY_SNAPSHOT
+CREATE OR REPLACE TABLE FACT_INVENTORY_SNAPSHOT AS
+SELECT
+    snapshot_date AS SNAPSHOT_DATE,
+    store_id      AS STORE_ID,
+    SUM(qty_on_hand)             AS TOTAL_UNITS_HELD,
+    SUM(qty_on_hand * unit_cost) AS TOTAL_INVENTORY_VAL
+FROM RAW_INVENTORY
+GROUP BY snapshot_date, store_id;
+
+SELECT * FROM FACT_INVENTORY_SNAPSHOT
+ORDER BY SNAPSHOT_DATE, STORE_ID;
+
+-- Task 4: Accumulating snapshot FACT_ORDER_FULFILLMENT
+CREATE OR REPLACE TABLE FACT_ORDER_FULFILLMENT AS
+SELECT
+    order_id      AS ORDER_ID,
+    order_date    AS ORDER_DATE,
+    pick_date     AS PICK_DATE,
+    ship_date     AS SHIP_DATE,
+    delivery_date AS DELIVERY_DATE,
+    DATEDIFF(day, order_date, pick_date)     AS PICK_LAG_DAYS,
+    DATEDIFF(day, pick_date, ship_date)      AS SHIP_LAG_DAYS,
+    DATEDIFF(day, ship_date, delivery_date)  AS DELIVERY_LAG_DAYS,
+    DATEDIFF(day, order_date, delivery_date) AS TOTAL_FULFILLMENT_DAYS
+FROM RAW_FULFILLMENT;
+
+SELECT ORDER_ID, PICK_LAG_DAYS, SHIP_LAG_DAYS, DELIVERY_LAG_DAYS, TOTAL_FULFILLMENT_DAYS
+FROM FACT_ORDER_FULFILLMENT
+WHERE DELIVERY_LAG_DAYS IS NOT NULL
+ORDER BY ORDER_ID;
+
+-- Task 5: Incomplete lifecycle status audit
+SELECT
+    ORDER_ID,
+    ORDER_DATE,
+    CASE
+        WHEN PICK_DATE IS NULL     THEN 'NOT_PICKED'
+        WHEN SHIP_DATE IS NULL     THEN 'PICKED_NOT_SHIPPED'
+        WHEN DELIVERY_DATE IS NULL THEN 'SHIPPED_NOT_DELIVERED'
+    END AS CURRENT_STATUS
+FROM FACT_ORDER_FULFILLMENT
+WHERE DELIVERY_DATE IS NULL
+ORDER BY ORDER_ID;
+
+-- Task 6: Aggregate revenue by junk dimension indicator
+SELECT
+    d.PAYMENT_METHOD,
+    COUNT(*)      AS TOTAL_ORDERS,
+    SUM(f.AMOUNT) AS TOTAL_REVENUE
+FROM FACT_SALES_TRANSACTIONS f
+JOIN DIM_ORDER_INDICATORS d
+  ON f.INDICATOR_SK = d.INDICATOR_SK
+GROUP BY d.PAYMENT_METHOD
+ORDER BY d.PAYMENT_METHOD;
